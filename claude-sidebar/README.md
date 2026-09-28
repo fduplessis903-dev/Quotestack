@@ -2,10 +2,11 @@
 
 A small always-on-top sidebar for macOS. It sits on the edge of your screen, shows your Claude Code usage, and slides out when a task finishes or when Claude needs your input.
 
-Written from scratch in about 900 lines of Swift, so you can read all of it. It uses **no third-party packages** and makes **no network calls**. It only reads files Claude Code already writes on your Mac.
+Written from scratch in about 900 lines of Swift, so you can read all of it. It uses **no third-party packages** and only talks to Anthropic (to read your plan usage). It only reads files Claude Code already writes on your Mac.
 
 ## What it shows
 
+- **Plan usage.** The same Session and Weekly bars as the Claude app's *Settings → Usage* page. These limits are shared by the Claude desktop app, claude.ai, Cowork and Claude Code. The sidebar reads them with the login Claude Code saved in your Keychain, so you need Claude Code installed and signed in once. That login is only ever sent to `api.anthropic.com`. This uses the same unofficial endpoint as Claude Code's `/usage` screen, so an Anthropic update could break it.
 - **Current 5-hour session.** A ring that fills as you use Claude, the time left until the window resets, and your burn rate. Claude plans meter usage in 5-hour windows, so this is the number that matters for hitting limits.
 - **Today.** Estimated cost, token count, and a breakdown by model (Opus, Sonnet, Haiku).
 - **Last 7 days.** A small bar chart.

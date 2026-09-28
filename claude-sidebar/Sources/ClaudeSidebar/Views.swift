@@ -142,16 +142,23 @@ struct SidebarRootView: View {
 struct CollapsedTab: View {
     @EnvironmentObject var sidebar: SidebarController
     @EnvironmentObject var usage: UsageStore
+    @EnvironmentObject var plan: PlanUsageStore
+
+    /// Real plan % when we have it, otherwise the estimate from local Claude Code logs.
+    private var fraction: Double {
+        if let session = plan.session { return min(session.percent / 100, 1) }
+        return usage.sessionFraction
+    }
 
     var body: some View {
         VStack(spacing: 10) {
             ZStack(alignment: .topTrailing) {
-                Ring(fraction: usage.sessionFraction, lineWidth: 3).frame(width: 18, height: 18)
+                Ring(fraction: fraction, lineWidth: 3).frame(width: 18, height: 18)
                 if sidebar.unread > 0 {
                     Circle().fill(Color.green).frame(width: 7, height: 7).offset(x: 3, y: -3)
                 }
             }
-            Text("\(Int(usage.sessionFraction * 100))%")
+            Text("\(Int(fraction * 100))%")
                 .font(.system(size: 9, weight: .semibold, design: .rounded))
                 .foregroundColor(.secondary)
             Image(systemName: sidebar.side == .right ? "chevron.left" : "chevron.right")
@@ -168,6 +175,8 @@ struct CollapsedTab: View {
 
 struct ExpandedView: View {
     @EnvironmentObject var sidebar: SidebarController
+    @EnvironmentObject var usage: UsageStore
+    @EnvironmentObject var plan: PlanUsageStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -178,14 +187,19 @@ struct ExpandedView: View {
             }
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 12) {
-                    SessionCard()
-                    TodayCard()
-                    WeekCard()
+                    PlanCard()
+                    if usage.summary.foundLogs {
+                        if plan.limits.isEmpty { SessionCard() }
+                        TodayCard()
+                        WeekCard()
+                    }
                     ActivityCard()
-                    Text("Costs are API-equivalent estimates from your local Claude Code logs, not your bill.")
-                        .font(.system(size: 9))
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    if usage.summary.foundLogs {
+                        Text("Dollar figures are API-equivalent estimates from your Claude Code logs, not your bill.")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
         }
@@ -221,6 +235,7 @@ struct Header: View {
 struct SettingsMenu: View {
     @EnvironmentObject var sidebar: SidebarController
     @EnvironmentObject var usage: UsageStore
+    @EnvironmentObject var plan: PlanUsageStore
 
     var body: some View {
         Picker("100% session mark", selection: $usage.sessionLimit) {
@@ -237,7 +252,10 @@ struct SettingsMenu: View {
         Toggle("Also send macOS notifications", isOn: $sidebar.systemNotifications)
         Toggle("Launch at login", isOn: Binding(get: { LoginItem.enabled }, set: { LoginItem.set($0) }))
         Divider()
-        Button("Refresh usage") { usage.refresh() }
+        Button("Refresh usage") {
+            usage.refresh()
+            plan.refresh()
+        }
         Button("Show test notification") { sidebar.present(.test) }
         Divider()
         Button("Quit Claude Sidebar") { NSApp.terminate(nil) }
@@ -272,6 +290,85 @@ struct ToastCard: View {
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(event.kind.color.opacity(0.5)))
         .contentShape(Rectangle())
         .onTapGesture { sidebar.dismissToast() }
+    }
+}
+
+/// The same bars as Claude's Settings → Usage page.
+struct PlanCard: View {
+    @EnvironmentObject var plan: PlanUsageStore
+
+    var body: some View {
+        Card(title: "Plan usage") {
+            if plan.limits.isEmpty {
+                Text(message)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(plan.limits) { LimitRow(limit: $0) }
+                if plan.status != .ok {
+                    Text(message)
+                        .font(.system(size: 9))
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private var message: String {
+        switch plan.status {
+        case .loading, .ok:
+            return "Loading…"
+        case .needsLogin:
+            return "Sign in to Claude Code once (type claude in Terminal) so the sidebar can read your plan usage."
+        case .expired:
+            return "Your Claude Code sign-in needs refreshing: open Claude Code once (type claude in Terminal)."
+        case .failed(let reason):
+            return "Couldn't reach Anthropic (\(reason)). Will retry."
+        }
+    }
+}
+
+struct LimitRow: View {
+    let limit: PlanLimit
+
+    private static let resetFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("EEE j:mm")
+        return f
+    }()
+
+    private var fraction: Double { min(max(limit.percent / 100, 0), 1) }
+    private var color: Color { fraction > 0.9 ? .red : fraction > 0.7 ? .orange : .claude }
+
+    private var resetText: String? {
+        guard let date = limit.resetsAt else { return nil }
+        let left = date.timeIntervalSinceNow
+        if left <= 0 { return "Resetting…" }
+        return left < 86_400 ? "Resets in \(Fmt.duration(left))" : "Resets \(Self.resetFormat.string(from: date))"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(limit.label).font(.system(size: 12, weight: .medium))
+                Spacer()
+                Text("\(Int(limit.percent.rounded()))%")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.12))
+                    Capsule().fill(color).frame(width: max(4, geo.size.width * fraction))
+                }
+            }
+            .frame(height: 6)
+            .animation(.easeOut(duration: 0.4), value: fraction)
+            if let resetText {
+                Text(resetText).font(.system(size: 10)).foregroundColor(.secondary)
+            }
+        }
     }
 }
 

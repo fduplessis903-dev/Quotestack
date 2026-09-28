@@ -32,13 +32,15 @@ final class SidebarController: ObservableObject {
     }
 
     let usage: UsageStore
+    let plan: PlanUsageStore
     private var panel: SidebarPanel!
     private var toastWork: DispatchWorkItem?
     private var openedByToast = false
     private var hovering = false
 
-    init(usage: UsageStore) {
+    init(usage: UsageStore, plan: PlanUsageStore) {
         self.usage = usage
+        self.plan = plan
         let defaults = UserDefaults.standard
         side = Side(rawValue: defaults.string(forKey: "side") ?? "") ?? .right
         playSound = defaults.object(forKey: "playSound") as? Bool ?? true
@@ -59,6 +61,7 @@ final class SidebarController: ObservableObject {
         let root = SidebarRootView()
             .environmentObject(self)
             .environmentObject(usage)
+            .environmentObject(plan)
             .environment(\.colorScheme, .dark)
         let host = NSHostingView(rootView: root)
         host.sizingOptions = [] // we size the window ourselves
@@ -78,7 +81,10 @@ final class SidebarController: ObservableObject {
     /// User clicked the tab / chevron.
     func toggle() {
         openedByToast = false
-        if !expanded { unread = 0 }
+        if !expanded {
+            unread = 0
+            plan.refresh()
+        }
         setExpanded(!expanded)
     }
 

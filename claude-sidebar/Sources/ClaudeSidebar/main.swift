@@ -2,14 +2,19 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let usage = UsageStore()
+    private let plan = PlanUsageStore()
     private let watcher = EventWatcher()
     private var sidebar: SidebarController!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        sidebar = SidebarController(usage: usage)
+        sidebar = SidebarController(usage: usage, plan: plan)
         sidebar.show()
         usage.start()
-        watcher.onEvent = { [weak self] event in self?.sidebar.present(event) }
+        plan.start()
+        watcher.onEvent = { [weak self] event in
+            self?.sidebar.present(event)
+            self?.plan.refresh()
+        }
         watcher.start()
     }
 }
