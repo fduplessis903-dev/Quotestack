@@ -152,6 +152,10 @@ struct CollapsedTab: View {
 
     var body: some View {
         VStack(spacing: 10) {
+            if sidebar.showMascot {
+                MiniMascot(mood: sidebar.unread > 0 ? .waving : .idle)
+                    .frame(width: 26, height: 22)
+            }
             ZStack(alignment: .topTrailing) {
                 Ring(fraction: fraction, lineWidth: 3).frame(width: 18, height: 18)
                 if sidebar.unread > 0 {
@@ -181,6 +185,9 @@ struct ExpandedView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Header()
+            if sidebar.showMascot {
+                MascotStage()
+            }
             if let toast = sidebar.toast {
                 ToastCard(event: toast)
                     .transition(.move(edge: .top).combined(with: .opacity))
@@ -248,6 +255,7 @@ struct SettingsMenu: View {
             Text("Right edge").tag(Side.right)
             Text("Left edge").tag(Side.left)
         }
+        Toggle("Show mascot", isOn: $sidebar.showMascot)
         Toggle("Play sound", isOn: $sidebar.playSound)
         Toggle("Also send macOS notifications", isOn: $sidebar.systemNotifications)
         Toggle("Launch at login", isOn: Binding(get: { LoginItem.enabled }, set: { LoginItem.set($0) }))
@@ -270,9 +278,14 @@ struct ToastCard: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: event.kind.icon)
-                .font(.system(size: 20))
-                .foregroundColor(event.kind.color)
+            if sidebar.showMascot {
+                MiniMascot(mood: event.kind == .done ? .waving : .alarmed)
+                    .frame(width: 34, height: 30)
+            } else {
+                Image(systemName: event.kind.icon)
+                    .font(.system(size: 20))
+                    .foregroundColor(event.kind.color)
+            }
             VStack(alignment: .leading, spacing: 3) {
                 Text("\(event.title) · \(event.project)")
                     .font(.system(size: 12, weight: .semibold))

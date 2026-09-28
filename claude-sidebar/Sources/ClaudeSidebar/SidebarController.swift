@@ -10,8 +10,10 @@ final class SidebarPanel: NSPanel {
 
 /// Owns the always-on-top panel glued to the screen edge and its collapsed/expanded state.
 final class SidebarController: ObservableObject {
-    static let collapsedSize = NSSize(width: 30, height: 128)
-    static let expandedSize = NSSize(width: 300, height: 580)
+    static let collapsedSize = NSSize(width: 30, height: 150)
+    static let expandedSize = NSSize(width: 300, height: 650)
+
+    let mascot = MascotBrain()
 
     @Published private(set) var expanded = false
     @Published private(set) var toast: AgentEvent?
@@ -23,6 +25,9 @@ final class SidebarController: ObservableObject {
     }
     @Published var playSound: Bool {
         didSet { UserDefaults.standard.set(playSound, forKey: "playSound") }
+    }
+    @Published var showMascot: Bool {
+        didSet { UserDefaults.standard.set(showMascot, forKey: "showMascot") }
     }
     @Published var systemNotifications: Bool {
         didSet {
@@ -44,6 +49,7 @@ final class SidebarController: ObservableObject {
         let defaults = UserDefaults.standard
         side = Side(rawValue: defaults.string(forKey: "side") ?? "") ?? .right
         playSound = defaults.object(forKey: "playSound") as? Bool ?? true
+        showMascot = defaults.object(forKey: "showMascot") as? Bool ?? true
         systemNotifications = defaults.object(forKey: "systemNotifications") as? Bool ?? false
 
         let panel = SidebarPanel(
@@ -100,6 +106,7 @@ final class SidebarController: ObservableObject {
         if !expanded || openedByToast { unread += 1 }
         if playSound { NSSound(named: event.kind == .done ? "Glass" : "Ping")?.play() }
         if systemNotifications { Notifier.post(event) }
+        if event.kind == .done { mascot.celebrate() } else { mascot.poke() }
 
         toast = event
         if !expanded {
