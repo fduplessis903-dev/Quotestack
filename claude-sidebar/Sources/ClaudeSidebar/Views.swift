@@ -2,7 +2,10 @@ import AppKit
 import SwiftUI
 
 extension Color {
-    static let claude = Color(red: 0.85, green: 0.47, blue: 0.34)
+    /// Claude orange, nudged brighter so it pops on dark glass.
+    static let claude = Color(red: 0.94, green: 0.53, blue: 0.37)
+    /// Secondary text: readable on dark glass (the system grey washes out).
+    static let dim = Color.white.opacity(0.66)
 }
 
 enum Fmt {
@@ -72,19 +75,34 @@ struct VisualEffect: NSViewRepresentable {
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
-/// Frosted background rounded only on the side facing away from the screen edge
-/// (the other side is pushed past the window bounds and clipped).
+/// Hairline "glass edge": bright where light hits the top-left, fading around the rest.
+let glassEdge = LinearGradient(
+    colors: [Color.white.opacity(0.5), Color.white.opacity(0.08), Color.white.opacity(0.22)],
+    startPoint: .topLeading, endPoint: .bottomTrailing)
+
+/// Dark smoked-glass background, rounded only on the side facing away from the screen
+/// edge (the other side is pushed past the window bounds and clipped).
 struct PanelBackground: ViewModifier {
     let side: Side
+    private let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
 
     func body(content: Content) -> some View {
         content.background(
-            VisualEffect()
-                .overlay(Color.black.opacity(0.2))
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.1)))
-                .padding(side == .right ? .trailing : .leading, -24)
+            ZStack {
+                VisualEffect()
+                // Smoke tint: keeps contrast high whatever is behind the panel.
+                LinearGradient(colors: [Color.black.opacity(0.62), Color.black.opacity(0.48)],
+                               startPoint: .top, endPoint: .bottom)
+                // Warm glow at the top.
+                RadialGradient(colors: [Color.claude.opacity(0.28), .clear],
+                               center: .top, startRadius: 0, endRadius: 260)
+                // Glossy sheen across the upper half.
+                LinearGradient(colors: [Color.white.opacity(0.12), .clear],
+                               startPoint: .top, endPoint: .center)
+            }
+            .clipShape(shape)
+            .overlay(shape.strokeBorder(glassEdge, lineWidth: 1))
+            .padding(side == .right ? .trailing : .leading, -24)
         )
     }
 }
@@ -97,11 +115,12 @@ struct Ring: View {
 
     var body: some View {
         ZStack {
-            Circle().stroke(Color.white.opacity(0.12), lineWidth: lineWidth)
+            Circle().stroke(Color.white.opacity(0.15), lineWidth: lineWidth)
             Circle()
                 .trim(from: 0, to: max(0.001, fraction))
                 .stroke(color, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
                 .rotationEffect(.degrees(-90))
+                .shadow(color: color.opacity(0.7), radius: 3)
         }
         .animation(.easeOut(duration: 0.4), value: fraction)
     }
@@ -114,14 +133,19 @@ struct Card<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title.uppercased())
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(.secondary)
-                .tracking(0.6)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(Color.white.opacity(0.5))
+                .tracking(0.8)
             content
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.white.opacity(0.06)))
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(LinearGradient(colors: [Color.white.opacity(0.11), Color.white.opacity(0.04)],
+                                     startPoint: .top, endPoint: .bottom))
+        )
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(glassEdge, lineWidth: 0.75))
     }
 }
 
@@ -164,10 +188,10 @@ struct CollapsedTab: View {
             }
             Text("\(Int(fraction * 100))%")
                 .font(.system(size: 9, weight: .semibold, design: .rounded))
-                .foregroundColor(.secondary)
+                .foregroundColor(.dim)
             Image(systemName: sidebar.side == .right ? "chevron.left" : "chevron.right")
                 .font(.system(size: 9, weight: .bold))
-                .foregroundColor(.secondary)
+                .foregroundColor(.dim)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .modifier(PanelBackground(side: sidebar.side))
@@ -204,7 +228,7 @@ struct ExpandedView: View {
                     if usage.summary.foundLogs {
                         Text("Dollar figures are API-equivalent estimates from your Claude Code logs, not your bill.")
                             .font(.system(size: 9))
-                            .foregroundColor(.secondary)
+                            .foregroundColor(.dim)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -292,7 +316,7 @@ struct ToastCard: View {
                     .lineLimit(1)
                 Text(event.detail)
                     .font(.system(size: 11))
-                    .foregroundColor(.secondary)
+                    .foregroundColor(.dim)
                     .lineLimit(4)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -315,7 +339,7 @@ struct PlanCard: View {
             if plan.limits.isEmpty {
                 Text(message)
                     .font(.caption)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(.dim)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(plan.limits) { LimitRow(limit: $0) }
@@ -372,14 +396,15 @@ struct LimitRow: View {
             }
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.12))
+                    Capsule().fill(Color.white.opacity(0.15))
                     Capsule().fill(color).frame(width: max(4, geo.size.width * fraction))
+                        .shadow(color: color.opacity(0.7), radius: 4)
                 }
             }
             .frame(height: 6)
             .animation(.easeOut(duration: 0.4), value: fraction)
             if let resetText {
-                Text(resetText).font(.system(size: 10)).foregroundColor(.secondary)
+                Text(resetText).font(.system(size: 10)).foregroundColor(.dim)
             }
         }
     }
@@ -397,7 +422,7 @@ struct SessionCard: View {
                     VStack(spacing: 0) {
                         Text("\(Int(usage.sessionFraction * 100))%")
                             .font(.system(size: 17, weight: .bold, design: .rounded))
-                        Text("used").font(.system(size: 9)).foregroundColor(.secondary)
+                        Text("used").font(.system(size: 9)).foregroundColor(.dim)
                     }
                 }
                 .frame(width: 72, height: 72)
@@ -407,17 +432,17 @@ struct SessionCard: View {
                         Text(Fmt.money(s.sessionCost))
                             .font(.system(size: 18, weight: .semibold, design: .rounded))
                         Text("of ~\(Fmt.money(usage.effectiveLimit)) · \(Fmt.tokens(s.sessionTokens)) tok")
-                            .font(.caption).foregroundColor(.secondary)
+                            .font(.caption).foregroundColor(.dim)
                         Label("Resets in \(Fmt.duration(end.timeIntervalSinceNow))", systemImage: "clock")
                             .font(.caption)
                         Label("\(Fmt.money(s.sessionBurnPerHour))/hr", systemImage: "flame")
-                            .font(.caption).foregroundColor(.secondary)
+                            .font(.caption).foregroundColor(.dim)
                     } else {
                         Text("No active session").font(.system(size: 13, weight: .semibold))
                         Text(s.foundLogs
                              ? "Starts with your next Claude Code message."
                              : "No Claude Code logs found in ~/.claude yet.")
-                            .font(.caption).foregroundColor(.secondary)
+                            .font(.caption).foregroundColor(.dim)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -435,14 +460,14 @@ struct TodayCard: View {
         Card(title: "Today") {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(Fmt.money(s.todayCost)).font(.system(size: 18, weight: .semibold, design: .rounded))
-                Text("\(Fmt.tokens(s.todayTokens)) tokens").font(.caption).foregroundColor(.secondary)
+                Text("\(Fmt.tokens(s.todayTokens)) tokens").font(.caption).foregroundColor(.dim)
             }
             ForEach(s.todayModels.prefix(4)) { m in
                 HStack(spacing: 6) {
                     Circle().fill(modelColor(m.model)).frame(width: 6, height: 6)
                     Text(m.model).font(.caption)
                     Spacer()
-                    Text(Fmt.money(m.cost)).font(.caption.monospacedDigit()).foregroundColor(.secondary)
+                    Text(Fmt.money(m.cost)).font(.caption.monospacedDigit()).foregroundColor(.dim)
                 }
             }
         }
@@ -470,7 +495,7 @@ struct WeekCard: View {
                             .frame(height: max(3, CGFloat(d.cost / maxCost) * 54))
                         Text(Self.weekday.string(from: d.day))
                             .font(.system(size: 9))
-                            .foregroundColor(.secondary)
+                            .foregroundColor(.dim)
                     }
                     .frame(maxWidth: .infinity)
                     .help("\(Fmt.money(d.cost)) · \(Fmt.tokens(d.tokens)) tokens")
@@ -478,7 +503,7 @@ struct WeekCard: View {
             }
             .frame(height: 72, alignment: .bottom)
             Text("Week total \(Fmt.money(week.reduce(0.0) { $0 + $1.cost }))")
-                .font(.caption).foregroundColor(.secondary)
+                .font(.caption).foregroundColor(.dim)
         }
     }
 }
@@ -490,14 +515,14 @@ struct ActivityCard: View {
         Card(title: "Recent activity") {
             if sidebar.events.isEmpty {
                 Text("When Claude Code finishes a task or needs your input, it pops out here.")
-                    .font(.caption).foregroundColor(.secondary)
+                    .font(.caption).foregroundColor(.dim)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(sidebar.events.prefix(8)) { EventRow(event: $0) }
                 Button("Clear") { sidebar.events.removeAll() }
                     .buttonStyle(.plain)
                     .font(.caption)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(.dim)
             }
         }
     }
@@ -515,9 +540,9 @@ struct EventRow: View {
                 HStack {
                     Text(event.project).font(.system(size: 11, weight: .semibold)).lineLimit(1)
                     Spacer()
-                    Text(Fmt.ago(event.date)).font(.system(size: 9)).foregroundColor(.secondary)
+                    Text(Fmt.ago(event.date)).font(.system(size: 9)).foregroundColor(.dim)
                 }
-                Text(event.detail).font(.system(size: 11)).foregroundColor(.secondary).lineLimit(2)
+                Text(event.detail).font(.system(size: 11)).foregroundColor(.dim).lineLimit(2)
             }
         }
     }

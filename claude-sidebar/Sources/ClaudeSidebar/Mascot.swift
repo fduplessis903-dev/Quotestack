@@ -207,6 +207,7 @@ struct MascotStage: View {
                 let pose = sidebar.mascot.pose(at: timeline.date.timeIntervalSinceReferenceDate)
                 MascotFigure(pose: pose)
                     .frame(width: size.width, height: size.height)
+                    .shadow(color: Color.claude.opacity(0.55), radius: 6)
                     .offset(x: sidebar.mascot.x * max(0, geo.size.width - size.width))
             }
         }
