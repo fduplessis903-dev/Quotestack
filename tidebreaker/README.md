@@ -1,6 +1,6 @@
 # Tidebreaker
 
-Battleships with special weapons. One HTML file, no install, nothing to build.
+Battleships with special weapons. One HTML file, no install, nothing to build, and no account of any kind needed to play.
 
 Open `index.html` in any modern browser and pick a mode:
 
@@ -32,8 +32,19 @@ One player chooses **Create room** and gets a 4-letter code. The other chooses *
 
 How your friend gets the game:
 
-1. **Host it (best).** Put `index.html` on any static host, for example GitHub Pages, Netlify Drop or Vercel. Then **Copy invite link** gives your friend a link that drops them straight into your room.
-2. **Send the file.** Send `index.html` to your friend. You both open it, and they join with your code.
+1. **A link (best, works on every phone).** Put the game online once, then share the link. On the hosted page, **Copy invite link** gives your friend a link that drops them straight into your room.
+2. **Send the file.** Send `index.html` to your friend. You both open it, and they join with your code. This works on computers and usually on Android phones. iPhones open a downloaded HTML file in a preview that can't run games, so iPhone players need the link.
+
+### Put it online with GitHub Pages (free, about two minutes)
+
+This repository is public, so GitHub can host the game for free:
+
+1. Open the repository's Pages settings: <https://github.com/fduplessis903-dev/Quotestack/settings/pages>
+2. Under **Build and deployment**, set **Source** to **Deploy from a branch**.
+3. Choose the branch that has the `tidebreaker` folder (for example `claude/sharp-shannon-w3h2ph`), keep the folder as **/ (root)**, and click **Save**.
+4. After a minute or two the game is live at <https://fduplessis903-dev.github.io/Quotestack/tidebreaker/>
+
+Anyone can open that link on a phone or computer, with no account. The empty `.nojekyll` file at the top of the repository tells GitHub to serve the files exactly as they are.
 
 Your ship positions never leave your device during the battle. Each player reports the result of every shot fired at their own fleet. When the battle ends, both fleets are revealed and every report is checked against a hash each player published before the first shot, so you can see that nobody lied.
 
