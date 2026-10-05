@@ -1884,12 +1884,15 @@ const icon = (k, cls = '') => `<svg class="ico ${cls}" viewBox="0 0 24 24" aria-
    fired, what happened to their own fleet). Two ways to carry it:
    - on claude.ai: the artifact room (presence is shared, kept for
      newcomers and re-sent after reconnects)
-   - as a standalone file: PeerJS, a direct WebRTC link between browsers
-   Both call back with cb.state(obj, from), cb.left(from), cb.status(s, why).
+   - as a standalone file: public MQTT relays over secure WebSockets.
+     Every state is published to several relays at once and kept there
+     as a "retained" message, so a friend can find the room even while
+     the host's phone has the game in the background.
+   Both call back with cb.state(obj, from, live), cb.left(from, gone),
+   cb.status(s, why).
    ===================================================================== */
 const IN_ARTIFACT = !!(window.claude && typeof window.claude.use === 'function');
 const ARTIFACT_URL = "https://claude.ai/artifact/KUq817XSVdXc5SVEh3GWjF";
-const PEER_PREFIX = 'tidebreaker-v1-';
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 function randId(n) {
   const a = new Uint8Array(n);
@@ -1899,141 +1902,308 @@ function randId(n) {
 const newCode = () => randId(4);
 const cleanCode = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
 
-function peerOptions() {
-  const o = { debug: 0 };
+/* Free public MQTT brokers. Using several at once means the game keeps
+   working while any one of them is reachable from both devices. */
+const RELAYS = [
+  { url: 'wss://broker.emqx.io:8084/mqtt' },
+  { url: 'wss://broker.hivemq.com:8884/mqtt' },
+  { url: 'wss://test.mosquitto.org:8081' },
+  { url: 'wss://mqtt.eclipseprojects.io/mqtt' },
+  { url: 'wss://public.cloud.shiftr.io', user: 'public', pass: 'public' },
+];
+function relayList() {
   try {
-    const q = new URLSearchParams(location.search);
-    if (q.get('peerhost')) {
-      o.host = q.get('peerhost');
-      o.port = +(q.get('peerport') || 443);
-      o.path = q.get('peerpath') || '/';
-      o.secure = q.get('peersecure') !== '0';
-    }
+    const q = new URLSearchParams(location.search).get('relay');
+    if (q) return q.split('|').filter(u => /^wss?:\/\//.test(u)).map(url => ({ url }));
   } catch (e) { /* no query string */ }
-  return o;
+  return RELAYS;
 }
 
-let peerLib = null;
-function loadPeerJS() {
-  if (window.Peer) return Promise.resolve(window.Peer);
-  if (peerLib) return peerLib;
-  const urls = [
-    'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js',
-    'https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js',
-    'https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js',
-  ];
-  peerLib = new Promise((resolve, reject) => {
-    let i = 0;
-    const next = () => {
-      if (window.Peer) return resolve(window.Peer);
-      if (i >= urls.length) { peerLib = null; return reject(new Error('lib')); }
-      const s = document.createElement('script');
-      s.src = urls[i++]; s.async = true;
-      s.onload = () => (window.Peer ? resolve(window.Peer) : next());
-      s.onerror = () => { s.remove(); next(); };
-      document.head.appendChild(s);
-    };
-    next();
-  });
-  return peerLib;
+/* ---------- a minimal MQTT 3.1.1 client over WebSocket ---------- */
+const utf8 = new TextEncoder(), unutf8 = new TextDecoder();
+const u16 = n => new Uint8Array([(n >> 8) & 255, n & 255]);
+function mqStr(s) {
+  const b = utf8.encode(s), out = new Uint8Array(2 + b.length);
+  out.set(u16(b.length));
+  out.set(b, 2);
+  return out;
 }
+function mqPacket(head, ...parts) {
+  let len = 0;
+  for (const p of parts) len += p.length;
+  const lenBytes = [];
+  let n = len;
+  do { let d = n % 128; n = Math.floor(n / 128); if (n > 0) d |= 128; lenBytes.push(d); } while (n > 0);
+  const out = new Uint8Array(1 + lenBytes.length + len);
+  out[0] = head;
+  out.set(lenBytes, 1);
+  let o = 1 + lenBytes.length;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+const MQ_PING = new Uint8Array([0xc0, 0]), MQ_BYE = new Uint8Array([0xe0, 0]);
 
-class PeerLink {
-  constructor(cb) {
-    this.cb = cb; this.peer = null; this.conns = new Map();
-    this.closed = false; this.last = null; this.tries = 0;
-    this.beat = setInterval(() => this.heartbeat(), 4000);
+class MqttWS {
+  constructor(relay, clientId, h) {
+    Object.assign(this, { relay, clientId, h, ws: null, up: false, closed: false, tries: 0, buf: new Uint8Array(0), lastRx: 0, nid: 1 });
+    this.subs = new Set();
+    this.pending = new Map();
+    this.connect();
   }
-  async open(role, code, fresh) {
+  connect() {
+    if (this.closed) return;
+    clearTimeout(this.retryTimer);
+    let ws;
+    try { ws = new WebSocket(this.relay.url, ['mqtt']); } catch (e) { this.retry(); return; }
+    ws.binaryType = 'arraybuffer';
+    this.ws = ws;
+    this.buf = new Uint8Array(0);
+    const guard = setTimeout(() => { if (this.ws === ws && !this.up) this.drop(); }, 12000);
+    ws.onopen = () => {
+      this.lastRx = Date.now();
+      const r = this.relay, auth = r.user != null;
+      const flags = 0x02 | (auth ? 0xc0 : 0);
+      const parts = [mqStr('MQTT'), new Uint8Array([4, flags]), u16(90), mqStr(this.clientId)];
+      if (auth) parts.push(mqStr(r.user), mqStr(r.pass || ''));
+      this.raw(mqPacket(0x10, ...parts));
+    };
+    ws.onmessage = e => { this.lastRx = Date.now(); if (e.data instanceof ArrayBuffer) this.feed(new Uint8Array(e.data)); };
+    ws.onclose = () => {
+      clearTimeout(guard);
+      if (this.ws !== ws) return;
+      this.ws = null;
+      const was = this.up;
+      this.up = false;
+      clearInterval(this.ka);
+      if (was) this.h.down();
+      this.retry();
+    };
+    ws.onerror = () => { /* onclose follows */ };
+  }
+  retry() {
+    if (this.closed) return;
+    clearTimeout(this.retryTimer);
+    const ms = Math.min(30000, 1000 * 2 ** Math.min(this.tries++, 5)) * (0.75 + Math.random() * 0.5);
+    this.retryTimer = setTimeout(() => this.connect(), ms);
+  }
+  drop() { const ws = this.ws; if (ws) { try { ws.close(); } catch (e) { /* closing */ } } }
+  reset() {
+    // After the page sat in the background its socket may be silently dead: start fresh.
+    if (this.closed) return;
+    const ws = this.ws;
+    if (ws) {
+      this.ws = null;
+      ws.onclose = ws.onmessage = ws.onerror = null;
+      try { ws.close(); } catch (e) { /* closing */ }
+    }
+    this.up = false;
+    clearInterval(this.ka);
+    this.tries = 0;
+    this.connect();
+  }
+  feed(chunk) {
+    const b = new Uint8Array(this.buf.length + chunk.length);
+    b.set(this.buf);
+    b.set(chunk, this.buf.length);
+    let o = 0;
+    for (;;) {
+      if (b.length - o < 2) break;
+      let len = 0, mul = 1, i = o + 1, byte = 0, ok = false;
+      while (i < b.length) {
+        byte = b[i++];
+        len += (byte & 127) * mul;
+        mul *= 128;
+        if (!(byte & 128)) { ok = true; break; }
+        if (mul > 128 ** 4) { this.drop(); return; }
+      }
+      if (!ok || i + len > b.length) break;
+      this.handle(b[o] >> 4, b[o] & 15, b.subarray(i, i + len));
+      o = i + len;
+    }
+    this.buf = b.slice(o);
+  }
+  handle(type, flags, body) {
+    if (type === 2) {
+      if (body.length < 2 || body[1] !== 0) { this.drop(); return; }
+      this.up = true;
+      this.tries = 0;
+      for (const t of this.subs) this.raw(mqPacket(0x82, u16(this.nextId()), mqStr(t), new Uint8Array([0])));
+      for (const [t, m] of this.pending) this.raw(mqPacket(0x30 | (m.retain ? 1 : 0), mqStr(t), utf8.encode(m.text)));
+      this.pending.clear();
+      clearInterval(this.ka);
+      this.ka = setInterval(() => this.keepalive(), 15000);
+      this.h.up();
+    } else if (type === 3) {
+      const qos = (flags >> 1) & 3;
+      const tl = (body[0] << 8) | body[1];
+      const topic = unutf8.decode(body.subarray(2, 2 + tl));
+      let i = 2 + tl;
+      if (qos > 0) {
+        const id = (body[i] << 8) | body[i + 1];
+        i += 2;
+        this.raw(mqPacket(qos === 1 ? 0x40 : 0x50, u16(id)));
+      }
+      this.h.message(topic, unutf8.decode(body.subarray(i)), (flags & 1) === 1);
+    } else if (type === 6) {
+      this.raw(mqPacket(0x70, body.subarray(0, 2)));
+    }
+  }
+  keepalive() {
+    if (!this.up) return;
+    if (Date.now() - this.lastRx > 50000) { this.drop(); return; }
+    this.raw(MQ_PING);
+  }
+  nextId() { this.nid = (this.nid % 65535) + 1; return this.nid; }
+  raw(bytes) { const ws = this.ws; if (ws && ws.readyState === 1) { try { ws.send(bytes); } catch (e) { /* closing */ } } }
+  subscribe(topic) {
+    this.subs.add(topic);
+    if (this.up) this.raw(mqPacket(0x82, u16(this.nextId()), mqStr(topic), new Uint8Array([0])));
+  }
+  unsubscribe(topic) {
+    this.subs.delete(topic);
+    if (this.up) this.raw(mqPacket(0xa2, u16(this.nextId()), mqStr(topic)));
+  }
+  publish(topic, text, retain) {
+    if (this.up) this.raw(mqPacket(0x30 | (retain ? 1 : 0), mqStr(topic), utf8.encode(text)));
+    else this.pending.set(topic, { text, retain });
+  }
+  close(finals) {
+    if (this.closed) return;
+    this.closed = true;
+    clearTimeout(this.retryTimer);
+    clearInterval(this.ka);
+    if (this.ws) {
+      if (this.up) {
+        for (const [t, text] of finals || []) this.raw(mqPacket(0x31, mqStr(t), utf8.encode(text)));
+        this.raw(MQ_BYE);
+      }
+      const ws = this.ws;
+      this.ws = null;
+      setTimeout(() => { try { ws.close(); } catch (e) { /* closing */ } }, 300);
+    }
+    this.up = false;
+  }
+}
+
+/* ---------- relay link: one room = one MQTT topic prefix ---------- */
+const TOPIC_ROOT = 'tidebreaker/v2/rooms/';
+const STALE_MS = 6 * 3600e3, AWAY_MS = 40000, BEAT_MS = 15000;
+class RelayLink {
+  constructor(cb) {
+    Object.assign(this, { cb, clients: [], closed: false, last: null, myPid: '', q: 0, lastPush: 0, shown: false, announced: false, hiddenAt: 0 });
+    this.seen = new Map();
+  }
+  open(role, code, fresh) {
     this.role = role; this.code = code; this.fresh = fresh;
     this.cb.status('connecting');
-    let Peer;
-    try { Peer = await loadPeerJS(); } catch (e) { if (!this.closed) this.cb.status('error', 'lib'); return; }
-    if (this.closed) return;
-    this.Peer = Peer;
-    this.start();
+    const handlers = { up: () => this.onUp(), down: () => this.onDown(), message: (t, s, r) => this.onMessage(t, s, r) };
+    this.clients = relayList().map(r => new MqttWS(r, 'tb' + randId(18).toLowerCase(), handlers));
+    for (const c of this.clients) c.subscribe(this.roomTopic());
+    this.beat = setInterval(() => this.heartbeat(), 5000);
+    this.slow = setTimeout(() => { if (!this.closed && !this.clients.some(c => c.up)) this.cb.status('offline'); }, 12000);
+    this.vis = () => {
+      if (document.visibilityState === 'hidden') { this.hiddenAt = Date.now(); return; }
+      const away = this.hiddenAt && Date.now() - this.hiddenAt > 8000;
+      this.hiddenAt = 0;
+      for (const c of this.clients) if (away || !c.up) c.reset();
+      clearTimeout(this.recheck);
+      this.recheck = setTimeout(() => this.onDown(), 7000);
+    };
+    this.net = () => { for (const c of this.clients) if (!c.up) c.reset(); };
+    document.addEventListener('visibilitychange', this.vis);
+    addEventListener('online', this.net);
   }
-  start() {
+  roomTopic(code) { return TOPIC_ROOT + (code || this.code).toLowerCase() + '/+'; }
+  myTopic() { return TOPIC_ROOT + this.code.toLowerCase() + '/' + this.myPid; }
+  onUp() {
     if (this.closed) return;
-    const id = this.role === 'h' ? PEER_PREFIX + this.code.toLowerCase() : PEER_PREFIX + 'g-' + randId(12).toLowerCase();
-    let peer;
-    try { peer = new this.Peer(id, peerOptions()); } catch (e) { this.cb.status('error', 'webrtc'); return; }
-    this.peer = peer;
-    peer.on('open', () => {
-      if (this.closed) return;
-      this.tries = 0;
-      if (this.role === 'h') this.cb.status('waiting'); else this.dial();
-    });
-    peer.on('connection', conn => { if (this.role === 'h') this.adopt(conn); else conn.close(); });
-    peer.on('disconnected', () => {
-      if (this.closed) return;
-      setTimeout(() => { try { if (!peer.destroyed && peer.disconnected) peer.reconnect(); } catch (e) { /* retry later */ } }, 2000);
-    });
-    peer.on('error', err => this.onError(err && err.type));
-  }
-  onError(type) {
-    if (this.closed) return;
-    if (type === 'unavailable-id' && this.role === 'h') {
-      try { this.peer.destroy(); } catch (e) { /* gone */ }
-      if (this.fresh && this.tries < 3) {
-        this.tries++;
-        this.code = this.cb.renamed(newCode());
-        return this.start();
-      }
-      if (++this.tries > 8) return this.cb.status('error', 'taken');
-      return setTimeout(() => this.start(), 2500);
-    }
-    if (type === 'peer-unavailable') { this.cb.status('notfound'); return this.redial(4000); }
-    if (type === 'browser-incompatible') return this.cb.status('error', 'webrtc');
-    if (type === 'network' || type === 'server-error' || type === 'socket-error' || type === 'socket-closed') {
-      this.cb.status('offline');
-      if (this.peer && this.peer.destroyed) setTimeout(() => this.start(), 4000);
+    if (!this.announced) {
+      this.announced = true;
+      // Give retained messages a moment to arrive before calling the room open.
+      this.settle = setTimeout(() => this.settled(), 1500);
+    } else {
+      this.cb.status('online');
+      this.push();
     }
   }
-  redial(ms) { clearTimeout(this.dialTimer); this.dialTimer = setTimeout(() => this.dial(), ms); }
-  dial() {
-    if (this.closed || this.role !== 'g' || !this.peer || this.peer.destroyed) return;
-    if (this.peer.disconnected) { try { this.peer.reconnect(); } catch (e) { /* wait for open */ } return; }
-    if ([...this.conns.keys()].some(c => c.open)) return;
-    const conn = this.peer.connect(PEER_PREFIX + this.code.toLowerCase(), { reliable: true, serialization: 'json' });
-    if (conn) this.adopt(conn);
+  onDown() { if (!this.closed && !this.clients.some(c => c.up)) this.cb.status('offline'); }
+  settled() {
+    if (this.closed) return;
+    if (this.role === 'h' && this.fresh && !this.shown && this.busy()) {
+      const old = this.code;
+      this.code = this.cb.renamed(newCode());
+      this.seen.clear();
+      for (const c of this.clients) { c.unsubscribe(this.roomTopic(old)); c.subscribe(this.roomTopic()); }
+      this.settle = setTimeout(() => this.settled(), 1500);
+      return;
+    }
+    this.shown = true;
+    this.cb.status('waiting');
+    this.push();
   }
-  adopt(conn) {
-    const meta = { seen: Date.now(), born: Date.now() };
-    this.conns.set(conn, meta);
-    conn.on('open', () => { meta.seen = Date.now(); this.cb.status('linked'); if (this.last) this.sendTo(conn, this.last); });
-    conn.on('data', d => {
-      meta.seen = Date.now();
-      if (d && d.t === 'st' && d.p && typeof d.p === 'object') this.cb.state(d.p, conn.peer);
-    });
-    conn.on('close', () => this.drop(conn));
-    conn.on('error', () => this.drop(conn));
+  busy() {
+    for (const rec of this.seen.values()) if (rec.p && rec.p.r === 'h' && rec.p.t && Date.now() - rec.p.t < 2 * 3600e3) return true;
+    return false;
   }
-  drop(conn) {
-    if (!this.conns.has(conn)) return;
-    this.conns.delete(conn);
-    try { conn.close(); } catch (e) { /* already closed */ }
-    this.cb.left(conn.peer);
-    if (this.role === 'g' && !this.closed) this.redial(2500);
+  onMessage(topic, text, retained) {
+    if (this.closed) return;
+    const prefix = TOPIC_ROOT + this.code.toLowerCase() + '/';
+    if (topic.slice(0, prefix.length) !== prefix) return;
+    const from = topic.slice(prefix.length);
+    if (!/^[A-Za-z0-9]{4,24}$/.test(from) || from === this.myPid) return;
+    if (!text) {
+      if (this.seen.has(from)) { this.seen.delete(from); this.cb.left(from, true); }
+      return;
+    }
+    let p;
+    try { p = JSON.parse(text); } catch (e) { return; }
+    if (!p || typeof p !== 'object' || p.id !== from) return;
+    if (p.t && Date.now() - p.t > STALE_MS) return;
+    const rec = this.seen.get(from) || { q: -1, liveAt: 0, away: false, p: null };
+    this.seen.set(from, rec);
+    const q = +p.q || 0;
+    if (!retained) rec.liveAt = Date.now();
+    if (q <= rec.q) {
+      if (!retained && rec.away) { rec.away = false; this.cb.state(rec.p, from, true); }
+      return;
+    }
+    rec.q = q;
+    rec.p = p;
+    if (!retained) rec.away = false;
+    this.cb.state(p, from, !retained);
   }
   heartbeat() {
     if (this.closed) return;
     const now = Date.now();
-    for (const [conn, meta] of this.conns) {
-      if (!conn.open && now - meta.born > 20000) { this.drop(conn); continue; }
-      if (conn.open && now - meta.seen > 16000) { this.drop(conn); continue; }
-      if (this.last) this.sendTo(conn, this.last);
+    if (this.shown && now - this.lastPush > BEAT_MS) this.push();
+    for (const [from, rec] of this.seen) {
+      if (rec.liveAt && !rec.away && now - rec.liveAt > AWAY_MS) { rec.away = true; this.cb.left(from, false); }
     }
-    if (this.role === 'g' && !this.conns.size) this.dial();
   }
-  sendTo(conn, state) { if (conn.open) { try { conn.send({ t: 'st', p: state }); } catch (e) { /* dropped */ } } }
-  send(state) { this.last = state; for (const conn of this.conns.keys()) this.sendTo(conn, state); }
+  push() {
+    if (!this.last || this.closed || !this.shown) return;
+    this.q = Math.max(Date.now(), this.q + 1);
+    const text = JSON.stringify(Object.assign({}, this.last, { q: this.q, t: Date.now() }));
+    for (const c of this.clients) c.publish(this.myTopic(), text, true);
+    this.lastPush = Date.now();
+  }
+  send(state) {
+    this.last = state;
+    this.myPid = state.id;
+    this.push();
+  }
   close() {
+    if (this.closed) return;
     this.closed = true;
-    clearInterval(this.beat); clearTimeout(this.dialTimer);
-    for (const conn of this.conns.keys()) { try { conn.close(); } catch (e) { /* gone */ } }
-    this.conns.clear();
-    if (this.peer) { try { this.peer.destroy(); } catch (e) { /* gone */ } }
+    clearInterval(this.beat);
+    clearTimeout(this.settle);
+    clearTimeout(this.slow);
+    clearTimeout(this.recheck);
+    document.removeEventListener('visibilitychange', this.vis);
+    removeEventListener('online', this.net);
+    // Leaving on purpose clears your seat, so the room doesn't look occupied.
+    const finals = this.myPid && this.shown ? [[this.myTopic(), '']] : [];
+    for (const c of this.clients) c.close(finals);
   }
 }
 
@@ -3191,14 +3361,14 @@ function askMenu() {
   confirmBox('Leave this battle?',
     net ? 'Your friend will be left waiting. You can rejoin from the main menu for a few hours.'
       : started ? 'Your battle is saved. Continue it any time from the main menu.' : 'Your fleet layout will be lost.',
-    'Leave', 'Keep playing', yes => { if (yes) { save(); toMenu(); } });
+    'Leave', 'Keep playing', yes => { if (yes) { save(true); toMenu(); } });
 }
-function save() {
+function save(left) {
   const m = G.m;
   if (!m || G.phase === 'over') return;
   if (m.kind !== 'net' && !m.started) return;
   const data = {
-    v: 1, t: Date.now(), persp: G.persp,
+    v: 1, t: Date.now(), persp: G.persp, left: !!left,
     m: { kind: m.kind, mode: m.mode, level: m.level, first: m.first, round: m.round, started: m.started,
       sides: m.sides.map(s => ({ name: s.name, fleet: s.fleet, actions: s.actions, results: s.results })) },
     net: m.kind === 'net' ? Online.snapshot() : null,
@@ -3281,7 +3451,7 @@ const isPrefix = (short, long) => short.every((s, i) => s === long[i]);
 const roundOf = p => Math.max(1, Math.min(999, p.g | 0));
 
 const Online = {
-  S: null, link: null, lostTimer: 0,
+  S: null, link: null, lostTimer: 0, findTimer: 0,
 
   session(role, code) {
     return {
@@ -3296,7 +3466,7 @@ const Online = {
     G.m = null;
     this.S = this.session('h', newCode());
     lobby('create');
-    paintCode(this.S.code);
+    paintCode('');
     lobbyStatus('Opening the room…', 'wait');
     this.connect(true);
   },
@@ -3315,27 +3485,43 @@ const Online = {
     G.m = null;
     this.S = this.session('g', code);
     lobby('joining');
-    lobbyStatus(`Looking for room ${code}…`, 'wait');
+    lobbyStatus('Connecting…', 'wait');
+    this.saveRoom();
     this.connect(false);
-    const S = this.S;
-    setTimeout(() => {
-      if (this.S === S && !S.paired && G.screen === 'lobby') lobbyStatus(`Nobody is in room ${code} yet. Check the code with your friend. Still looking…`, 'bad');
-    }, 15000);
   },
   connect(fresh) {
     const S = this.S;
     const cb = {
-      state: (p, from) => { if (this.S === S) this.onState(p, from); },
-      left: from => { if (this.S === S) this.onLeft(from); },
+      state: (p, from, live) => { if (this.S === S) this.onState(p, from, live); },
+      left: (from, gone) => { if (this.S === S) this.onLeft(from, gone); },
       status: (s, why) => { if (this.S === S) this.onStatus(s, why); },
-      renamed: code => { S.code = code; paintCode(code); return code; },
+      renamed: code => { S.code = code; return code; },
     };
-    this.link = IN_ARTIFACT ? new RoomLink(cb) : new PeerLink(cb);
+    this.link = IN_ARTIFACT ? new RoomLink(cb) : new RelayLink(cb);
     this.link.open(S.role, S.code, fresh);
     this.publish();
   },
+  saveRoom() {
+    const S = this.S;
+    if (!S || S.paired) return;
+    store.set('tb.room', JSON.stringify({ t: Date.now(), role: S.role, code: S.code, pid: S.pid, name: S.name, mode: S.mode }));
+  },
+  resumeLobby(r) {
+    this.leave();
+    G.m = null;
+    const S = this.S = Object.assign(this.session(r.role === 'h' ? 'h' : 'g', cleanCode(r.code)), {
+      pid: String(r.pid).slice(0, 24), name: cleanName(r.name) || G.name, mode: r.mode === 'classic' ? 'classic' : 'tide',
+    });
+    lobby(S.role === 'h' ? 'create' : 'joining');
+    if (S.role === 'h') paintCode(S.code); else $('#in-code').value = S.code;
+    lobbyStatus('Reconnecting to the room…', 'wait');
+    this.saveRoom();
+    this.connect(false);
+  },
   leave() {
     clearTimeout(this.lostTimer);
+    clearTimeout(this.findTimer);
+    store.del('tb.room');
     if (this.link) { this.link.close(); this.link = null; }
     this.S = null;
     $('#netbar').hidden = true;
@@ -3378,48 +3564,61 @@ const Online = {
     const S = this.S;
     S.link = s;
     const inGame = G.screen === 'game';
-    if (s === 'connecting') { if (!inGame) lobbyStatus(S.role === 'h' ? 'Opening the room…' : `Looking for room ${S.code}…`, 'wait'); }
-    else if (s === 'waiting') { if (!inGame) lobbyStatus(S.role === 'h' ? 'Room open. Waiting for your friend to join…' : `Looking for room ${S.code}…`, 'wait'); }
-    else if (s === 'linked') { if (!inGame) lobbyStatus('Connected. Saying hello…', 'ok'); }
-    else if (s === 'notfound') { if (!inGame && !S.paired) lobbyStatus(`No room ${S.code} yet. Check the code with your friend. Still trying…`, 'bad'); }
-    else if (s === 'offline') { if (inGame) this.netbar('Connection lost. Trying to reconnect…'); else lobbyStatus('Can\'t reach the matchmaking server. Retrying…', 'bad'); }
-    else if (s === 'online') { if (S.oppOnline) $('#netbar').hidden = true; }
-    else if (s === 'error') {
-      const msg = {
-        lib: 'Couldn\'t load the online play library. Check your internet connection and try again.',
-        webrtc: 'This browser can\'t make direct connections. Try a current Chrome, Edge, Firefox or Safari.',
-        taken: 'That room code is busy. Go back and create a new room.',
-        size: 'This battle got too long to sync. Start a rematch.',
-      }[why] || (IN_ARTIFACT
-        ? 'Online play isn\'t available for this viewer. You need to be signed in to claude.ai and invited to this page.'
-        : 'Online play stopped working. Go back and try again.');
+    if (s === 'connecting') {
+      if (!inGame) lobbyStatus(S.role === 'h' ? 'Opening the room…' : 'Connecting…', 'wait');
+    } else if (s === 'waiting') {
+      if (S.role === 'h') {
+        if (!S.paired) { paintCode(S.code); lobbyStatus('Room open. Waiting for your friend to join…', 'wait'); this.saveRoom(); }
+      } else if (!S.paired && !S.oppPid) {
+        lobbyStatus(`Looking for room ${S.code}…`, 'wait');
+        clearTimeout(this.findTimer);
+        this.findTimer = setTimeout(() => {
+          if (this.S === S && !S.oppPid && G.screen === 'lobby') lobbyStatus(`There's no room ${S.code} right now. Check the code with your friend, or ask them to create the room again. Still looking…`, 'bad');
+        }, 4000);
+      }
+    } else if (s === 'offline') {
+      if (inGame) this.netbar('Connection lost. Reconnecting…');
+      else lobbyStatus('Can\'t reach the game servers. Check your internet connection. Still trying…', 'bad');
+    } else if (s === 'online') {
+      if (S.oppOnline) $('#netbar').hidden = true;
+    } else if (s === 'error') {
+      const msg = why === 'size' ? 'This battle got too long to sync. Start a rematch.'
+        : IN_ARTIFACT ? 'Online play isn\'t available for this viewer. You need to be signed in to claude.ai and invited to this page.'
+          : 'Online play stopped working. Go back and try again.';
       if (inGame) this.netbar(msg); else lobbyStatus(msg, 'bad');
     }
     this.paintNet();
   },
-  onLeft(from) {
+  onLeft(from, gone) {
     const S = this.S;
     if (!S || from !== S.oppFrom) return;
     S.oppOnline = false;
     this.paintNet();
     clearTimeout(this.lostTimer);
+    if (!S.paired) {
+      if (gone && S.role === 'g' && G.screen === 'lobby') { S.oppPid = ''; lobbyStatus(`${S.oppName} closed the room. Ask them for a new code.`, 'bad'); }
+      return;
+    }
     this.lostTimer = setTimeout(() => {
-      if (this.S === S && !S.oppOnline && G.screen === 'game') this.netbar(`${S.oppName} disconnected. Waiting for them to come back…`);
-    }, 3500);
+      if (this.S === S && !S.oppOnline && G.screen === 'game') {
+        this.netbar(gone ? `${S.oppName} left the match. You can wait here in case they rejoin.` : `${S.oppName} seems to be away. The battle carries on when they're back.`);
+      }
+    }, gone ? 0 : 3500);
   },
-  onState(p, from) {
+  onState(p, from, live) {
     const S = this.S;
     if (!validState(p) || p.id === S.pid) return;
+    live = live !== false;
     if (S.role === 'h') {
       if (p.r !== 'g') return;
       if (!S.oppPid) {
         if (p.o && p.o !== S.pid) return;
-        this.track(p, from);
+        this.track(p, from, live);
         this.pair(p, false);
       } else if (p.id !== S.oppPid) {
         const quiet = !S.oppOnline && Date.now() - S.oppSeen > 15000;
         if (!quiet || !['lobby', 'deploy', 'ready'].includes(S.st) || (p.o && p.o !== S.pid)) return;
-        this.track(p, from);
+        this.track(p, from, live);
         this.pair(p, true);
       }
     } else {
@@ -3429,21 +3628,34 @@ const Online = {
         if (!S.paired) lobbyStatus('That room already has two captains. Ask your friend to create a new room.', 'bad');
         return;
       }
+      clearTimeout(this.findTimer);
       if (!S.oppPid) { S.oppPid = p.id; this.publish(); }
-      if (p.o !== S.pid) { if (!S.paired) lobbyStatus('Found the room. Waiting for the host…', 'ok'); this.track(p, from); return; }
-      if (!S.paired) { this.track(p, from); S.mode = p.md === 'c' ? 'classic' : 'tide'; this.pair(p, false); }
+      if (p.o !== S.pid) {
+        this.track(p, from, live);
+        if (!S.paired) this.waitForHost(p);
+        return;
+      }
+      if (!S.paired) { this.track(p, from, live); S.mode = p.md === 'c' ? 'classic' : 'tide'; this.pair(p, false); }
     }
-    this.track(p, from);
+    this.track(p, from, live);
     this.sync(p);
   },
-  track(p, from) {
+  waitForHost(p) {
+    const S = this.S, name = cleanName(p.n) || 'your friend';
+    lobbyStatus(`Found ${name}'s room. Joining…`, 'ok');
+    clearTimeout(this.findTimer);
+    this.findTimer = setTimeout(() => {
+      if (this.S === S && !S.paired && G.screen === 'lobby') lobbyStatus(`Found ${name}'s room, but ${name} isn't on the game screen right now. Ask them to open it. You'll join automatically.`, 'ok');
+    }, 5000);
+  },
+  track(p, from, live) {
     const S = this.S;
     S.oppFrom = from;
     S.oppSeen = Date.now();
     S.last = p;
     S.oppName = cleanName(p.n) || 'Friend';
     if (G.m && G.m.kind === 'net') G.m.sides[1].name = S.oppName;
-    if (!S.oppOnline) {
+    if (!S.oppOnline && live !== false) {
       S.oppOnline = true;
       clearTimeout(this.lostTimer);
       $('#netbar').hidden = true;
@@ -3452,6 +3664,8 @@ const Online = {
   },
   pair(p, replace) {
     const S = this.S;
+    clearTimeout(this.findTimer);
+    store.del('tb.room');
     S.oppPid = p.id;
     S.paired = true;
     if (S.role === 'g') S.round = roundOf(p);
@@ -3623,7 +3837,7 @@ function lobby(kind) {
   $('#lobby-join').hidden = kind === 'create';
   $('#lobby-note').textContent = IN_ARTIFACT
     ? 'Your friend needs a claude.ai account and access to this page. Use Share to invite them by email, then send them the code. Your ship positions stay on your device until the battle ends.'
-    : 'You both need an internet connection. The game links your browsers directly, and your ship positions stay on your device until the battle ends.';
+    : 'You both need an internet connection. Moves travel through free public relay servers, so anyone who knows the room code could watch them. Your ship positions stay on your device until the battle ends.';
 }
 function lobbyStatus(text, tone) {
   $('#lobby-status-text').textContent = text;
@@ -3631,8 +3845,9 @@ function lobbyStatus(text, tone) {
   $('#lobby-status').hidden = !text;
 }
 function paintCode(code) {
-  $('#room-code').textContent = code;
-  const url = inviteURL(code);
+  $('#room-code').textContent = code || '····';
+  $('#btn-copy-code').disabled = !code;
+  const url = code ? inviteURL(code) : '';
   $('#invite-wrap').hidden = !url;
   $('#invite-url').value = url;
   $('#create-text').textContent = url
@@ -3792,6 +4007,13 @@ function wire() {
   addEventListener('resize', () => { if (G.screen === 'game' && G.m) render(); });
 }
 
+function loadRoom() {
+  try {
+    const r = JSON.parse(store.get('tb.room', 'null'));
+    return r && (r.role === 'h' || r.role === 'g') && typeof r.code === 'string' && typeof r.pid === 'string' ? r : null;
+  } catch (e) { return null; }
+}
+
 function boot(data) {
   FX.init();
   makeBoard('mine');
@@ -3804,14 +4026,21 @@ function boot(data) {
   showScreen('menu');
   if (navigator.webdriver) window.__tb = { G, Online, B, viewOf, turnsDone, winnerAt, chargeAt, encFleet };
   const join = /^#join-([a-z0-9]{4})$/i.exec(location.hash || '');
-  const saved = loadSave();
+  const saved = loadSave(), room = loadRoom();
+  // A page that reloads mid-match (phones often do this to background tabs) picks the
+  // online match or open room straight back up. Leaving on purpose turns this off.
+  const recent = d => d && Date.now() - d.t < 15 * 60e3;
+  const liveNet = saved && saved.m.kind === 'net' && !saved.left;
   if (join) {
     const code = join[1].toUpperCase();
-    if (saved && saved.m.kind === 'net' && saved.net.code === code) resumeSave(saved);
+    if (liveNet && saved.net.code === code) resumeSave(saved);
+    else if (recent(room) && room.code === code) Online.resumeLobby(room);
     else Online.openJoin(code);
     return;
   }
   if (data && data.resume && saved) resumeSave(saved);
+  else if (liveNet && recent(saved)) resumeSave(saved);
+  else if (recent(room)) Online.resumeLobby(room);
 }
 
 (function start() {

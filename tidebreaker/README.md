@@ -28,7 +28,9 @@ Classic rules are still there (pick **Classic** on the menu), but the default **
 
 ## Playing a friend online
 
-One player chooses **Create room** and gets a 4-letter code. The other chooses **Join with code** and types it in. The two browsers connect directly with WebRTC, using the free public [PeerJS](https://peerjs.com/) server only to find each other.
+One player chooses **Create room** and gets a 4-letter code. The other chooses **Join with code** and types it in.
+
+Moves travel through free public MQTT relay servers (EMQX, HiveMQ, Mosquitto, Eclipse and shiftr.io). The game sends every move through all of them at once, so it keeps working while any one of them is reachable. Each player's latest state stays stored on the relays, so your friend can still find your room while your phone has the game in the background. If a phone reloads the page in the middle of hosting or playing, the game reopens the same room or match by itself.
 
 How your friend gets the game:
 
@@ -46,9 +48,9 @@ This repository is public, so GitHub can host the game for free:
 
 Anyone can open that link on a phone or computer, with no account. The empty `.nojekyll` file at the top of the repository tells GitHub to serve the files exactly as they are.
 
-Your ship positions never leave your device during the battle. Each player reports the result of every shot fired at their own fleet. When the battle ends, both fleets are revealed and every report is checked against a hash each player published before the first shot, so you can see that nobody lied.
+Your ship positions never leave your device during the battle. Each player reports the result of every shot fired at their own fleet. When the battle ends, both fleets are revealed and every report is checked against a hash each player published before the first shot, so you can see that nobody lied. The relays are public, so anyone who knows your room code could watch the moves.
 
-Both players need an internet connection. A small number of strict networks (some office or school networks) block direct browser connections. If you can't connect, try a phone hotspot.
+Both players need an internet connection. Some school or office networks block relay servers. If you can't connect on one of those, try mobile data.
 
 ## Controls
 
@@ -61,4 +63,4 @@ Both players need an internet connection. A small number of strict networks (som
 
 - The sea, explosions, splashes, torpedoes, missiles and aircraft are drawn live with WebGL and canvas. All sound is synthesised in the browser, so there are no asset files.
 - Games in progress are saved in the browser, so you can close the tab and continue from the menu.
-- If you run your own PeerJS server, add `?peerhost=your.host&peerport=443&peerpath=/` to the page URL.
+- To use your own MQTT broker instead of the public ones, add `?relay=wss://your.broker/mqtt` to the page URL. Separate several brokers with `|`.
